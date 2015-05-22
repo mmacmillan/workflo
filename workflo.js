@@ -5,7 +5,6 @@
  * @description provides a workflow centric approach to managing and running your aws SWF workflows.  offers a simple workflow schema to centralize workflow definitions and handling.
  * @author Mike MacMillan (mikejmacmillan@gmail.com)
  */
-
 var Q = require('q'),
     _ = require('lodash'),
     aws = require('aws-sdk'),
@@ -25,7 +24,8 @@ var workflow = {
         var workflowObj = _.assign({
             name: name,
             domain: this.swfDomain,
-            config: [],
+            config: {},
+            swfConfig: {},
 
             verify: function() {
                 var def = Q.defer();
@@ -37,23 +37,26 @@ var workflow = {
                 }
 
                 //** see if the workflow exists already, with this name/version
-                lib.workflow.exists(workflowObj.name, workflowObj.config.version)
+                lib.workflow.exists(workflowObj.name, workflowObj.swfConfig.version)
                     .then(verifyTasks)
                     .catch(function() {
                         var obj = _.extend({
                             name: workflowObj.name,
                             domain: workflowObj.domain,
-                            defaultTaskStartToCloseTimeout: '30', //** 30 second limit on tasks to finish, within this workflow
-                            defaultExecutionStartToCloseTimeout: ''+ ((60*60*24)*30) //** 30 days default, task limits will eliminate bottlenecks, but some workflows can take weeks
-                        }, workflowObj.config||{});
+                            defaultTaskStartToCloseTimeout: '5', //** 5 second limit on tasks to finish, within this workflow, if none specified @ the task level
+                            defaultExecutionStartToCloseTimeout: ''+ ((60*60*24)*180), //** 180 days default, task limits will eliminate bottlenecks, but some workflows can take weeks
+                            defaultChildPolicy: 'TERMINATE', //** by default, when terminated, child processes will also be terminated
+                            defaultTaskList: lib.defaultTaskList
+                        }, workflowObj.swfConfig||{});
 
                         //** create it otherwise
-                        console.log('creating workflow: ', workflowObj.name, workflowObj.config.version);
-                        lib.workflow.create(workflowObj.name, workflowObj.config.version, obj)
+                        lib.emit('workflow:create', workflowObj);
+                        lib.workflow.create(workflowObj.name, workflowObj.swfConfig.version, obj)
                             .then(verifyTasks)
                             .catch(def.reject);
 
-                    }.bind(this));
+                    }.bind(this))
+                    .catch(def.reject);
 
                 return def.promise;
             },
@@ -69,25 +72,73 @@ var workflow = {
                     return p.resolve();
                 }
 
-                var data = {};
+                var data = {},
+                    lastFailed = history.lastFailedActivity(),
+                    lastCompleted = history.lastCompletedActivity(),
+                    lastScheduled = history.lastScheduledActivity(),
+                    previousFail = false;
 
-                //** 2) get the last completed activity, extract the result data.  by getting the last completed task, this will automatically
-                //** retry activityTasks that were scheduled but not completed, when they are rescheduled.
-                var lastCompleted = history.lastCompletedActivity();
-                if(lastCompleted) {
+                //** 2) we need to see if there was an error with one of the previous activities that needs to be handled
 
-                    var args = lastCompleted.activityTaskCompletedEventAttributes;
+                //** if we have a failed task, but no completed tasks, we're need to retrying the same task again
+                if(lastFailed && !lastCompleted)
+                    previousFail = true;
 
-                    //** if the last completed activity had a result, it could be the next step's name
-                    try {
-                        data = JSON.parse(args && args.result);
-                    } catch (e) {}
+                //** since our last event could be many things other than a fail or complete event for an activity, compare the
+                //** last failed activity with the last completed activity; if the last completed activity comes after the failure
+                //** we can safely assume the failure was recovered; if the failure came after, we need to recover from that failure
+                if(lastFailed && lastCompleted) {
+                    var lastFailId = lastFailed.args().scheduledEventId,
+                        lastCompletedId = lastCompleted.args().scheduledEventId;
+
+                    if(parseInt(lastFailId) >= parseInt(lastCompletedId))
+                        previousFail = true;
                 }
 
+                if(previousFail) {
+                    var details = lastFailed.args().details,
+                        activity = null;
+
+                    //** see if the task that failed specified what its next step should be
+                    if (!!details.next)
+                        activity = this.getActivity(details.next);
+                    else {
+                        //** otherwise, attempt to retrieve the last task scheduled to be run
+                        if (lastScheduled) {
+                            var args = lastScheduled.args(),
+                                name = args && args.activityType && args.activityType.name;
+
+                            //** if found, assign the activity so its scheduled to be run
+                            name && (activity = this.getActivity(name));
+                        }
+                    }
+
+                    //** before scheduling a new activity, see if we've hit our maximum failures allows for this workflow
+                    if (this.config && this.config.maxFailures) {
+                        var failed = history.eventsByType('ActivityTaskFailed').length;
+                        if (failed >= parseInt(this.config.maxFailures)) {
+                            decision.failWorkflow(details, 'maximum failures reached');
+                            return p.resolve();
+                        }
+                    }
+
+
+                    //** if a fail activity was found, run it
+                    if(activity) {
+                        decision.scheduleActivity(activity);
+                        return p.resolve();
+                    }
+                }
+
+                //** 3) get the last completed activity, extract the result data.  by deciding what task to run based on the last *completed* task,
+                //** that means we will always be running the correct next task, regardless if a thousand failed iterations of the next task ran before this decision
+                if(lastCompleted)
+                    data = lastCompleted.args().result;
+
                 //** 3) see if the last step's data indicates the next step
-                if(data.nextStep) {
+                if(data.next) {
                     var nextStep = _.find(this.activities, function(act) {
-                        return act.name == data.nextStep;
+                        return act.name == data.next;
                     });
 
                     //** if we found the step by name, schedule it to be run
@@ -102,16 +153,18 @@ var workflow = {
                 this.onEvaluate && this.onEvaluate(context, decision);
 
                 //** 6) finally, let any consumers evaluate the context and decisions
-                lib.emit('workflow:evaluate', context, decision);
+                lib.emit('workflow:evaluate', this, context, decision);
 
                 p.resolve();
+            },
+
+            getActivity: function(name) {
+                return _.find(this.activities, function(act) { return act.name == name; });
             },
 
             runActivity: function(name, context, response) {
                 var def = Q.defer(),
                     prm = def.promise;
-
-                util.log('runActivity: '+ name);
 
                 //** get a reference to the workflows handler for this task
                 var activityHandler = this.handlers[name];
@@ -122,6 +175,7 @@ var workflow = {
 
                 //** trigger the handler; if it returns a promise, this is an async operation...handle it accordingly.  otherwise,
                 //** it is synchronous, and we resolve() it immediately; any errors will bubble up to the parent catch()
+                lib.emit('workflow:runActivity', this, name);
                 var promise = activityHandler(context, response);
                 !!promise
                     ? promise.then(def.resolve, def.reject)
@@ -129,15 +183,19 @@ var workflow = {
 
                 return prm;
             }
-
-
         }, opts||{});
+
+
+        //** define some workflo specific config settings
+        _.defaults(workflowObj.config, {
+            maxFailures: 10
+        });
 
         //** parse the activities defined as activityType objects
         workflowObj.activities = _.map(workflowObj.activities||[], function(obj) {
             //** override the default task list, if the workflow has it specified
             if(!obj.defaultTaskList)
-                obj.defaultTaskList = workflowObj.config.defaultTaskList;
+                obj.defaultTaskList = workflowObj.swfConfig.defaultTaskList;
 
             return this.activity.define(obj.name, obj);
         }.bind(this));
@@ -151,7 +209,9 @@ var workflow = {
 
         //** call the verify() method of each workflow, waiting for them all to finish verifying before continuing
         var actions = _.map(_workflows, function(obj) { return obj.verify(); });
-        Q.all(actions).then(def.resolve, def.reject);
+        Q.all(actions)
+            .then(def.resolve)
+            .catch(def.reject);
 
         return def.promise;
     },
@@ -172,6 +232,20 @@ var workflow = {
         !!version && (opts.version = version);
 
         return this.svc.registerWorkflowType(opts);
+    },
+
+    execute: function(id, name, version, opts) {
+        opts = _.defaults(opts||{}, {
+            domain: this.swfDomain,
+            taskList: this.defaultTaskList,
+            workflowId: id || (name + Date.now()),
+            workflowType: {
+                name: name,
+                version: version || '1.0'
+            }
+        });
+
+        return this.svc.startWorkflowExecution(opts);
     }
 
 };
@@ -211,7 +285,7 @@ var activity = {
                     .catch(function() {
 
                         //** create it otherwise
-                        console.log('creating activity: ', obj.name, obj.version);
+                        this.emit('activity:create', obj);
                         this.activity.create(opts).then(def.resolve, def.reject);
 
                     }.bind(this));
@@ -258,42 +332,51 @@ var poll = {
      * @class poll
      */
 
+    //** opts: maximumPageSize, <add more>
     decision: function(opts) {
         typeof(opts) == 'string' && (opts = { taskList: { name: opts }});
-        _.defaults(opts||{}, { domain: this.swfDomain });
+        opts = _.defaults(opts||{}, {
+            domain: this.swfDomain,
+            taskList: this.defaultTaskList
+        });
 
         function handleTask(data) {
             if(!!data.taskToken) {
                 //** get a execution context, grabbing the ref to the workflow object we're executing
                 var ctx = new workflowContext(data, this),
-                    decision = new decisionResponse(ctx),
-                    flow = ctx && ctx.workflow,
-                    def = Q.defer(),
-                    prm = def.promise;
+                    lib = this;
 
-                //** let the workflow definition evaluate the context and decide on the next action
-                flow.evaluate(def, ctx, decision);
+                //** make sure we've loaded the full event history for this workflow...in the future this could be optional
+                ctx.loadFullHistory().then(function() {
 
-                prm
-                    .then(function() {
-                        //** if a decision has been made, send it
-                        if(decision.decided()) {
+                    var decision = new decisionResponse(ctx),
+                        flow = ctx && ctx.workflow,
+                        def = Q.defer(),
+                        prm = def.promise;
+
+                    //** let the workflow definition evaluate the context and decide on the next action
+                    flow.evaluate(def, ctx, decision);
+
+                    //** if a decision has been made, send it
+                    prm.then(function () {
+                        if (decision.decided()) {
                             console.log('sending decision: ', decision.decisions[0]);
-                            this.svc.respondDecisionTaskCompleted({
+                            lib.svc.respondDecisionTaskCompleted({
                                 taskToken: decision.taskToken,
                                 decisions: decision.decisions
                             });
                         }
 
-                        this.emit('decision', decision);
-                    }.bind(this))
-                    .catch(this.emit.bind(this, 'error', decision))
-                    .finally(function() {
-                        //** continue polling...always polling
-                        setTimeout(this.poll.decision.bind(this, opts), 0);
-                    }.bind(this));
-            } else
-                setTimeout(this.poll.decision.bind(this, opts), 0);
+                        lib.emit('decision', decision);
+                    })
+
+                    //** report any errors
+                    .catch(lib.emit.bind(lib, 'error', decision));
+                });
+            }
+
+            //** continue polling...always polling
+            setTimeout(this.poll.decision.bind(this, opts), 0);
         }
 
         this.emit('polling', opts);
@@ -303,7 +386,10 @@ var poll = {
 
     activity: function(opts) {
         typeof(opts) == 'string' && (opts = { taskList: { name: opts }});
-        _.defaults(opts||{}, { domain: this.swfDomain });
+        opts = _.defaults(opts||{}, {
+            domain: this.swfDomain,
+            taskList: this.defaultTaskList
+        });
 
         function handleTask(data) {
             if(!!data.taskToken) {
@@ -319,10 +405,12 @@ var poll = {
 
                 function done(success) {
                     this.emit('activity:'+ (!!success?'success':'fail'), ctx);
-                    setTimeout(this.poll.activity.bind(this, opts), 0);
                 }
-            } else
-                setTimeout(this.poll.activity.bind(this, opts), 0);
+
+                //** if we do nothing, it will time out and run the task again after it times out...
+            }
+
+            setTimeout(this.poll.activity.bind(this, opts), 0);
         }
 
         this.emit('polling', opts);
@@ -367,6 +455,26 @@ var decisions = {
             decisionType: 'CompleteWorkflowExecution',
             completeWorkflowExecutionDecisionAttributes: { result: result }
         }
+    },
+
+    failWorkflow: function(details, reason) {
+        details = details||{};
+        typeof(details) == 'object' && (details = JSON.stringify(details));
+
+        return {
+            decisionType: 'FailWorkflowExecution',
+            failWorkflowExecutionDecisionAttributes: { details: details, reason: reason }
+        }
+    },
+
+    cancelWorkflow: function(details) {
+        details = details||{};
+        typeof(details) == 'object' && (details = JSON.stringify(details));
+
+        return {
+            decisionType: 'CancelWorkflowExecution',
+            cancelWorkflowExecutionDecisionAttributes: { details: details }
+        }
     }
 };
 
@@ -380,14 +488,51 @@ var decisions = {
 function workflowContext(data, lib) {
     data = data||{};
 
+    function loadHistory(nextPageToken) {
+        var started = this.history.eventsByType('WorkflowExecutionStarted').pop(),
+            taskList = {},
+            def = Q.defer();
+
+        //** find the tasklist from the workflow execution started event
+        if(!!started)
+            taskList = started.args().taskList;
+
+        lib.svc.pollForDecisionTask({
+            domain: lib.swfDomain,
+            taskList: taskList,
+            nextPageToken: nextPageToken
+        })
+            .then(function(data) {
+                //** add the history events
+                data = data||{};
+                this.history.addEvents(data.events||[]);
+
+                //** if there is a next page token, keep following the token...otherwise, resolve the promise, indicating history is "good"
+                !!data.nextPageToken
+                    ? loadHistory.call(this, data.nextPageToken).then(def.resolve)
+                    :  def.resolve();
+            }.bind(this))
+            .catch(def.reject);
+
+        return def.promise;
+    }
+
     _.extend(this, data, {
         //** provide a reference to the workflow being executed, along with an eventHistory collection for access events
         lib: lib,
         workflow: data.workflowType && _workflows[data.workflowType.name],
-        history: new eventHistory(data.events)
-    });
+        history: new eventHistory(data.events),
 
-    var y = 1;
+        loadFullHistory: function() {
+            var def = Q.defer();
+
+            !!data.nextPageToken
+                ? loadHistory.call(this, data.nextPageToken).then(def.resolve)
+                : def.resolve();
+
+            return def.promise;
+        }
+    });
 };
 
 
@@ -435,6 +580,14 @@ _.extend(decisionResponse.prototype, {
     //** queue a complete workflow decision, with the given result; if an object, it will be serialized to json
     completeWorkflow: function(result) {
         this.decisions.push(decisions.completeWorkflow(result));
+    },
+
+    failWorkflow: function(details, reason) {
+        this.decisions.push(decisions.failWorkflow(details, reason));
+    },
+
+    cancelWorkflow: function(details) {
+        this.decisions.push(decisions.cancelWorkflow(details));
     }
 });
 
@@ -465,8 +618,7 @@ _.extend(activityResponse.prototype, {
     //** an easy way to indicate to the decider what the next step should be
     complete: function(result) {
         //** if the result is a string, assume it to be the name of the next step
-        if(typeof(result) == 'string')
-            result = { nextStep: result };
+        typeof(result) == 'string' && (result = { next: result });
 
         //** we resolve/reject this responses promise for any consumers of the handler task that was run for this execution
         var prm = this.context.lib.activity.complete(this.taskToken, JSON.stringify(result));
@@ -475,18 +627,33 @@ _.extend(activityResponse.prototype, {
     },
 
     fail: function(details, reason) {
-        var prm = this.context.lib.activity.fail(this.taskToken, details, reason);
+        //** allow details to be an object, but pass a string to the api.  if no reason is provided, assume details are the "reason"
+        details = details||{};
+        if(typeof(details) == 'string') {
+            if(!reason) {
+                reason = details;
+                details = {};
+            } else
+                details = { next: details };
+        }
+
+        var prm = this.context.lib.activity.fail(this.taskToken, JSON.stringify(details), reason);
         prm.then(this._defer.resolve, this._defer.reject);
         return prm;
     },
 
     cancel: function(details) {
+        //** allow details to be an object, but pass a string to the api
+        typeof(details) == 'object' && (details = JSON.stringify(details));
+
         var prm = this.context.lib.activity.cancel(this.taskToken, details);
         prm.then(this._defer.resolve, this._defer.reject);
         return prm;
     },
 
     completeWorkflow: function(result) {
+        result = result||{};
+
         //** if the result is a string, do not assume it is serialized, pass it as the result
         if(typeof(result) == 'string')
             result = { result: result };
@@ -526,6 +693,12 @@ _.assign(eventHistory.prototype, {
     current: function() { return this.sorted[this.sorted.length > 0 && this.sorted.length - 1 || 0]; },
     previous: function() { return this.sorted[this.sorted.length - (this.sorted.length >= 2 ? 2 : 1)]; },
 
+    addEvents: function(events) {
+        !Array.isArray(events) && (events = [events]);
+        this.events = this.events.concat(events);
+        this.sorted = this.sortBy(function(evt) { return evt.eventTimestamp });
+    },
+
     lastActivity: function() {
         return this.eventsByType('ActivityTaskStarted').pop();
     },
@@ -538,11 +711,18 @@ _.assign(eventHistory.prototype, {
         return this.eventsByType('ActivityTaskCompleted').pop();
     },
 
+    lastFailedActivity: function() {
+        return this.eventsByType('ActivityTaskFailed').pop();
+    },
+
     //** returns a filtered listed of the event history based on event type
     eventsByType: function(type) {
         return this.filter(function(evt) {
-            return evt.eventType.toLowerCase() == (type||'').toLowerCase();
-        });
+            if(evt.eventType.toLowerCase() == (type||'').toLowerCase()) {
+                this.wrapEvent(evt);
+                return true;
+            }
+        }.bind(this));
     },
 
     //** is this the first decision we're making for this particular execution of this workflow
@@ -557,6 +737,29 @@ _.assign(eventHistory.prototype, {
 
     hasCompletedActivity: function() {
         return !!this.lastCompletedActivity();
+    },
+
+    wrapEvent: function(evt) {
+        if(!!evt.args) return evt;
+
+        //** wraps and extends the event object with helpers
+        _.assign(evt, {
+            //** provides easy access to the event args.  they are commonly stored as <EventTypeName>EventAttributes
+            args: function() {
+                var name = evt.eventType[0].toLowerCase() + evt.eventType.slice(1);
+                return this[name +'EventAttributes'] || {};
+            }
+        });
+
+        //** try to parse the fields that may hold json data
+        var args = evt.args();
+        try {
+            if(args.details && typeof(args.details) == 'string')
+                args.details = JSON.parse(args.details);
+
+            if(args.result && typeof(args.result) == 'string')
+                args.result = JSON.parse(args.result);
+        } catch(e) {}
     }
 });
 
@@ -565,40 +768,49 @@ _.assign(eventHistory.prototype, {
 var workflo = module.exports = function(opt) {
     events.EventEmitter.call(this);
 
-    //** simple wrapper function for introducing a promise interface
-    function wrap(ctx, fn, key) {
-        return function() {
-            var def = Q.defer(),
-                args = _.toArray(arguments);
-
-            args.push(def.makeNodeResolver());
-            fn.apply(ctx, args);
-
-            return def.promise;
-        }
-    }
-
     //** proxy the options unchanged to the aws-sns sdk for creation
-    this.swf = new aws.SWF((opt=opt||{}));
+    this.swf = new aws.SWF((opt = opt || {}));
     this.swfDomain = opt.domain;
+    this.defaultTaskList = opt.defaultTaskList;
     this.svc = {};
 
     //** create a curried version of each swf sdk api function, introducing a promise interface, hoisting it to a service object
-    _.each(this.swf.constructor.prototype, function(obj, key) {
-        if(typeof(obj) !== 'function' || key == 'constructor') return;
-        this.svc[key] = wrap(this.swf, obj, key);
+    _.each(this.swf.constructor.prototype, function (fn, key) {
+        if (typeof(fn) !== 'function' || key == 'constructor') return;
+        this.svc[key] = Q.nbind(fn, this.swf);
     }.bind(this));
 
-    var scope = function(ctx, fn, key) { 
+    var scope = function (ctx, fn, key) {
         ctx[key] = fn.bind(this);
         return ctx;
     }.bind(this);
 
     //** scope each of the individual service libs
-    this.workflow = _.reduce(workflow, scope, {}); 
+    this.workflow = _.reduce(workflow, scope, {});
     this.activity = _.reduce(activity, scope, {});
     this.poll = _.reduce(poll, scope, {});
     this.decisions = _.reduce(decisions, scope, {});
+
+    //** simple helper function to execute a workflow, using the syntax: workflo.run('some-test-workflow')
+    this.run = function (name, id, taskList, opts) {
+        opts = opts || {};
+        var def = Q.defer();
+
+        //** get the workflow we're trying to run
+        var wkflow = _workflows[name];
+
+        if(!wkflow) {
+            def.reject('Could not find the target workflow');
+        } else {
+            //** use the version of the workflow we're running (in case multiple versions exist in swf)
+            var version = opts.version || wkflow.swfConfig.version;
+            !!taskList && (opts.taskList = { name: taskList });
+
+            //** execute the tasklist
+            this.workflow.execute(id, name, version, opts).done();
+        }
+
+        return def.promise;
+    }.bind(this);
 };
 util.inherits(workflo, events.EventEmitter);
-
