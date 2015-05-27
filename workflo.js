@@ -212,18 +212,6 @@ var workflow = {
         return workflowObj;
     },
 
-    verifyAll: function() {
-        var def = Q.defer();
-
-        //** call the verify() method of each workflow, waiting for them all to finish verifying before continuing
-        var actions = _.map(_workflows, function(obj) { return obj.verify(); });
-        Q.all(actions)
-            .then(def.resolve)
-            .catch(def.reject);
-
-        return def.promise;
-    },
-
     exists: function(name, version) {
         return this.svc.describeWorkflowType({
             domain: this.swfDomain,
@@ -242,12 +230,26 @@ var workflow = {
         return this.svc.registerWorkflowType(opts);
     },
 
+    load: function(workflowId, runId) {
+        return this.svc.describeWorkflowExecution({
+            domain: this.swfDomain,
+            execution: {
+                runId: runId,
+                workflowId: workflowId
+            }
+        });
+    },
+
     execute: function(name, version, data, opts) {
+        //** when firing off multiple workflows, using Date.now() as the unique identifier, its not uncommon to trigger an exception related
+        //** to using the same workflowId twice (WorkflowExecutionAlreadyStartedFault), so add a simple bit of randomness to it
+        var rnd = (Math.random().toFixed(5)*10000).toFixed(0);
+
         //** provide the default options for starting a workflow, if not specified
         opts = _.defaults(opts||{}, {
             domain: this.swfDomain,
             taskList: this.defaultTaskList,
-            workflowId: name +'-'+ Date.now(),
+            workflowId: name +'-'+ Date.now() + rnd,
             workflowType: {
                 name: name,
                 version: version||'1.0'
@@ -641,10 +643,13 @@ _.extend(activityContext.prototype, {
     async: function() { return this._defer.promise; },
 
     //** accepts a result as a string or an object.  if the result is a string, it is assumed to be the next steps name.  this allows
-    //** an easy way to indicate to the decider what the next step should be
-    complete: function(result) {
+    //** an easy way to indicate to the decider what the next step should be.
+    complete: function(result, nextStep) {
+        result = result||{};
+
         //** if the result is a string, assume it to be the name of the next step
         typeof(result) == 'string' && (result = { next: result });
+        !!nextStep && (result.next = nextStep);
 
         //** we resolve/reject this responses promise for any consumers of the handler task that was run for this execution
         var prm = this.lib.activity.complete(this.context.taskToken, JSON.stringify(result));
@@ -876,5 +881,18 @@ var workflo = module.exports = function(opt) {
 
         return def.promise;
     }.bind(this);
+
+    //** a helper to asynchronously verify all the workflows and their activities with SWF
+    this.verifyWorkflows = function() {
+        var def = Q.defer();
+
+        //** call the verify() method of each workflow, waiting for them all to finish verifying before continuing
+        var actions = _.map(_workflows, function(obj) { return obj.verify(); });
+        Q.all(actions)
+            .then(def.resolve)
+            .catch(def.reject);
+
+        return def.promise;
+    }
 };
 util.inherits(workflo, events.EventEmitter);
