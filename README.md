@@ -5,13 +5,13 @@
 
 ###What is the AWS Simple Workflow Service?
 
-[(I am already familiar with this stuff...)](#What-does-Workflo.js-do)
+[(I am already familiar with this stuff...)](#what-does-workflojs-do)
 
 The [AWS Simple Workflow Service](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/SWF.html), SWF, is a webservice that allows you to define [_Workflows_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-about-workflows.html), which are comprised of [_Tasks_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-tasks.html), that represent processes within your business/organization/stack.  
 
 A processes may be registering a user with your system, charging a payment account, generating the thumbnails for an image or set of images and publishing them to a CDN, transcoding a video, aggregating log files...whatever.  If the process can be broken into individual _Tasks_, and would benefit from each task being executed in a reliable manner, then a _Workflow_ may be the right way to package it.
 
-Your workflows are invoked via the SWF API, but the execution is handled your servers by [_Workers_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dg-develop-activity.html) and [_Deciders_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dg-dev-deciders.html).  A _Worker_ or _Decider_ is simply a Node.js process that you define, which connects to SWF via HTTP, and, using a [standard long-poll method](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-comm-proto.html), listens for the next action to process, or decision to make.
+Your workflows are invoked via the SWF API, but the execution is handled on your servers by [_Workers_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dg-develop-activity.html) and [_Deciders_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dg-dev-deciders.html).  A _Worker_ or _Decider_ is simply a Node.js process that you define, which connects to SWF via HTTP, and, using a [standard long-poll method](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-comm-proto.html), listens for the next action to process, or decision to make.
 
 This design allows your _Workers_ and _Deciders_ to be very flexible; there is no limit to how many you can have, where they are located, what sort of hardware they run on; this can simplify scaling/adding more capacity, often reduced to just adding more _Workers_. 
 
@@ -21,12 +21,26 @@ Using SWF, you can avoid extensive boilerplate development for configuring and m
 
 ###What does Workflo.js do?
 
-Workflo.js simplifies the process of using the [AWS Simple Workflow Service](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/SWF.html), with Node.js by providing a framework for defining your _Workflows_ and their _Tasks_ using a JSON schema.  Workflo provides functionality for registering and validating these _Workflows_/_Tasks_ via the AWS SDK, and provides a base implementation for your _Workers_ and _Deciders_ which handles the core orchestration logic for making decisions, running tasks, and handling failures.  This allows you to focus development on your _Workflows_ and _Tasks_, from the start.
+Workflo.js simplifies the process of using the [AWS Simple Workflow Service](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/SWF.html), with Node.js by providing a framework for defining your _Workflows_ and their _Tasks_ using a JSON schema.  Workflo provides a facade around the [AWS-SDK](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/SWF.html), adding a promise implementation to the base library using [Q](https://github.com/kriskowal/q), with added functionality including:
+
+   - defining _Workflows_ using a JSON schema
+   - automatic registration and validation of _Workflows_/_Tasks_ with the API
+   - helpers for running _Workflows_ and executing _Tasks_
+   - chainable methods using promises
+   - polling for decisions using a _DecisionContext_, which supports:
+     - automatically, recursively, loading a _Workflow's_ full event history
+     - helpers to access specific events in the _Workflow's_ event history, ex last completed task, last failed task, next scheduled task, etc
+     - an _EventHistory_ collection, which provides functional helpers and methods for accessing and isolating events in the _Workflow's_ event history
+     - helper methods for driving workflows (failing, completing, cancelling, scheduling tasks)
+   - polling for tasks using an _ActivityContext_, which supports:
+     - JSON data serialization/deserialization for persisting task/workflow state in the _Workflow's_ meta data between _Task_ Execution
+     - _Task_ level helper methods for driving the _Workflows_ and _Tasks_ (completing, failing, cancelling _Tasks_, completing and cancelling the _Workflow_, starting child _Workflows_, etc)
+ 
+Workflo also provides a base implementation for your _Workers_ and _Deciders_ which handles the core orchestration logic for making decisions, running tasks, and handling failures.  This allows you to focus development on your _Workflows_ and _Tasks_, not the plumbing, from the start.
 
 
 ###Enough words, show me code
 ```
-//** workflows can be defined in multiple files, contain multiple definitions, etc
 Workflo.define('handle-website-order', {
 
     //** defines the workflows meta-data that will be registered with the SWF API
@@ -34,7 +48,7 @@ Workflo.define('handle-website-order', {
         description: 'after we charge the users card, we send them a receipt and add them to our mailing list'
     },
 
-    //** defines the tasks meta-data
+    //** defines the tasks meta-data that will be registered with the SWF API
     tasks: [
         { 
             name: 'generate-pdf',
@@ -116,5 +130,3 @@ Workflow.run('handle-website-order', {
 1. Check out the Basic Example
 1. Browse some additional examples
 1. Using EC2?  Download an AMI that has this all already configured [here]()
-
-
