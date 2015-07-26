@@ -1,26 +1,27 @@
 #Workflo.js
 
->Workflo.js is a schema-based framework, based on the AWS SWF SDK, for easily defining and executing your workflows  
-
-Workflo.js simplifies the process of using the [AWS Simple Workflow Service](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/SWF.html), **SWF**, with Node.js by providing a framework for defining your _workflows_ and their _tasks_ using a JSON schema.  Workflo automatically handles registration and validation via the SWF API, and provides a base implementation for your _workers_ and _deciders_ which handles the core orchestration logic for making decisions, running tasks, and handling failures.  This allows you to focus development on your _workflows_ and _tasks_, from the start.
+>Workflo.js is a schema-based framework, based on the AWS SWF SDK, for easily defining, registering, and executing your workflows
 
 
 ###What is the AWS Simple Workflow Service?
 
-The [AWS Simple Workflow Service](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/SWF.html) is a webservice that allows you to define [_workflows_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-about-workflows.html), which are comprised of [_tasks_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-tasks.html), that represent processes within your business/organization/stack.  These processes can be API calls, database calls, shell scripts, whatever; you define how each task is handled via code.
+[(I am already familiar with this stuff...)](#What-does-Workflo.js-do)
 
-These workflows are triggered remotely via the SWF API, which then defers to your servers for queue-based distributed execution in a manner that supports retry, failover, multiple outcomes, etc. at both the _task_ and _workflow_ level.  
+The [AWS Simple Workflow Service](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/SWF.html), SWF, is a webservice that allows you to define [_Workflows_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-about-workflows.html), which are comprised of [_Tasks_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-tasks.html), that represent processes within your business/organization/stack.  
 
-The execution is handled by processes called [_Workers_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dg-develop-activity.html) and [_Deciders_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dg-dev-deciders.html).  A _Worker_ or _Decider_ is simply a Node.js process that you define, which connects to SWF via HTTP, and, using a [standard long-poll method](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-comm-proto.html), listens for the next action to process, or decision to make.
+A processes may be registering a user with your system, charging a payment account, generating the thumbnails for an image or set of images and publishing them to a CDN, transcoding a video, aggregating log files...whatever.  If the process can be broken into individual _Tasks_, and would benefit from each task being executed in a reliable manner, then a _Workflow_ may be the right way to package it.
 
-A great part about SWF is the fact that the _Workers_ or _Deciders_ are just processes; there is no limit to how many you can have, where they are located, what sort of hardware they run on...you can even define which _Workers_ handle which _workflows_/_tasks_ if needed.  This allows you to easily isolate the processing of certain workflows or tasks to one part of your infrastructure, maybe based on specific CPU/Memory/Compliance needs, while running the rest in another part.  
+Your workflows are invoked via the SWF API, but the execution is handled your servers by [_Workers_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dg-develop-activity.html) and [_Deciders_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dg-dev-deciders.html).  A _Worker_ or _Decider_ is simply a Node.js process that you define, which connects to SWF via HTTP, and, using a [standard long-poll method](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-comm-proto.html), listens for the next action to process, or decision to make.
 
-This saves a lot of boilerplate development for configuring and maintaining message queues, defining and orchestrating async processes distributed across multiple machines, executing tasks vs making decisions in a reliable and redundant manner,  providing failover and retry mechanisms, etc.
+This design allows your _Workers_ and _Deciders_ to be very flexible; there is no limit to how many you can have, where they are located, what sort of hardware they run on; this can simplify scaling/adding more capacity, often reduced to just adding more _Workers_. 
 
-One thing to keep in mind is that each _Worker_ or _Decider_ must be stateless; this is because each decision and task execution could potentially be handled by a different _Decider_ or _Worker_ (ie, a process on another machine) than the previous.
+You can also [define which _Workers_ handle which _Workflows_/_Tasks_](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-task-lists.html) if needed.  This allows you to easily isolate the processing of certain workflows or tasks to one part of your infrastructure, maybe based on specific CPU/Memory/Compliance needs, while running the rest in another part of your infrastructure.  
 
-Another thing to keep in mind, is that due to the nature of how these tasks are executed, its usually not a good idea to put waiting for the completion of a workflow in the critical path of a response to a client's web request; workflows are intended to supplement processes that are able to be deferred, can fail and be retried if necessary, multiple times, and generally occur "behind the scenes".
+Using SWF, you can avoid extensive boilerplate development for configuring and maintaining message queues, defining and orchestrating task execution across multiple servers with failover and retry mechanisms...a lot of code.
 
+###What does Workflo.js do?
+
+Workflo.js simplifies the process of using the [AWS Simple Workflow Service](http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/SWF.html), with Node.js by providing a framework for defining your _Workflows_ and their _Tasks_ using a JSON schema.  Workflo provides functionality for registering and validating these _Workflows_/_Tasks_ via the AWS SDK, and provides a base implementation for your _Workers_ and _Deciders_ which handles the core orchestration logic for making decisions, running tasks, and handling failures.  This allows you to focus development on your _Workflows_ and _Tasks_, from the start.
 
 
 ###Enough words, show me code
@@ -85,7 +86,7 @@ Workflo.define('handle-website-order', {
                 .then(task.completeWorkflow)
                 .catch(function(err) {
                     return task.fail(err);
-                };
+                });
         
             return task.async();
         }
@@ -101,4 +102,19 @@ Workflow.run('handle-website-order', {
 
 ```
 
-in progress...
+###Ok, What's Next?
+1. Install Workflo.js
+> npm install workflo
+
+1. If you haven't used the Simple Workflow Service before, you need to [register a domain](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dg-register-domain-console.html)
+   - you [may use more than one domain](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-domain.html) if you're implementation calls for it, but you need at least one.
+1. [Create an IAM User](http://docs.aws.amazon.com/IAM/latest/UserGuide/Using_SettingUpUser.html) to use specifically for SWF
+   - Attach the policy "SimpleWorkflowFullAccess"
+     - If those permissions don't work for you, [read this guide](http://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-iam.html) for configuring an IAM policy for SWF.
+   - [Get the Access Key and Secret](http://docs.aws.amazon.com/IAM/latest/UserGuide/ManagingCredentials.html) for the SWF user
+1. View the Documentation
+1. Check out the Basic Example
+1. Browse some additional examples
+1. Using EC2?  Download an AMI that has this all already configured [here]()
+
+

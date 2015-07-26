@@ -30,7 +30,9 @@ var workflow = {
 
             //** defines some workflo specific config/defaults
             config: {
-                maxFailures: 10
+                maxFailures: 5,
+                maxDecisionTimeouts: 5,
+                maxActivityTimeouts: 5
             },
 
             verify: function() {
@@ -70,6 +72,7 @@ var workflow = {
             evaluate: function(p, context) {
                 var data = {},
                     history = context.history,
+                    config = context.workflow && context.workflow.config,
                     lastFailed = history.lastFailedActivity(),
                     lastCompleted = history.lastCompletedActivity(),
                     lastScheduled = history.lastScheduledActivity(),
@@ -117,7 +120,7 @@ var workflow = {
                         }
                     }
 
-                    //** before scheduling a new activity, see if we've hit our maximum failures allows for this workflow
+                    //** before scheduling a new activity, see if we've hit our maximum failures allowed for this workflow
                     if (this.config && this.config.maxFailures) {
                         var failed = history.eventsByType('ActivityTaskFailed').length;
                         if (failed >= parseInt(this.config.maxFailures)) {
@@ -141,13 +144,22 @@ var workflow = {
                     return p.resolve();
                 }
 
+
+                //** before we potentially schedule another activity, we need to evaluate if the previous resulted in a timeout that caused our threshold to be exceeded; this prevents tasks doomed to fail, from looping indefinitely
+                var activityTimeouts = history.eventsByType('ActivityTaskTimedOut');
+
+                if(activityTimeouts.length >= config.maxActivityTimeouts)
+                    context.failWorkflow('Max ActivityTaskTimedOut events encountered');
+
+
                 //** get the last completed activity, extract the result data.  by deciding what task to run based on the last *completed* task,
                 //** that means we will always be running the correct next task, regardless if a thousand failed iterations of the next task ran before this decision
                 if(lastCompleted)
                     data = lastCompleted.args().result;
 
+
                 //** 3) see if the last step's data indicates the next step
-                if(data.next) {
+                if(!context.decided() && data.next) {
                     var nextStep = _.find(this.activities, function(act) {
                         return act.name == data.next;
                     });
@@ -156,9 +168,23 @@ var workflow = {
                     nextStep && context.schedule(nextStep);
                 }
 
-                //** 4) if we haven't decided yet, see if the last step's data indicates the workflow is complete
-                if(!context.decided() && data.workflowComplete)
-                    context.completeWorkflow(data);
+                //** 4) if we haven't decided yet...
+                if(!context.decided()) {
+                    //** see if the last step's data indicates the workflow is complete
+                    if (!!data.workflowComplete)
+                        context.completeWorkflow(data);
+
+                    //** otherwise, this could mean we're stuck; no decision has been made, the "next" step couldn't be easily determined; find out
+                    else {
+
+                        //** see if we're in a "timeout loop", where a decision can't be made, and its continually rescheduling a decision
+                        var decisionTimeouts = history.eventsByType('DecisionTaskTimedOut');
+
+                        //** if we've exceeded the max timeouts, fail the workflow
+                        if(decisionTimeouts.length >= config.maxDecisionTimeouts)
+                            context.failWorkflow('Max DecisionTaskTimedOut events encountered');
+                    }
+                }
 
                 //** 5) let the workflow itself evaluate these decisions and provide any modifications
                 this.onEvaluate && this.onEvaluate(context);
@@ -186,7 +212,7 @@ var workflow = {
 
                 //** trigger the handler; if it returns a promise, this is an async operation...handle it accordingly.  otherwise,
                 //** it is synchronous, and we resolve() it immediately; any errors will bubble up to the parent catch()
-                lib.emit('workflow:runActivity', this, name);
+                lib.emit('activity:run', this, name);
                 var promise = activityHandler(context);
                 !!promise
                     ? promise.then(def.resolve, def.reject)
@@ -407,7 +433,7 @@ var poll = {
             setTimeout(this.poll.decision.bind(this, opts), 0);
         }
 
-        this.emit('polling', opts);
+        this.emit('poll:decider', opts);
         this.svc.pollForDecisionTask(opts).done(handleTask.bind(this));
         return this;
     },
@@ -424,6 +450,8 @@ var poll = {
                 //** get a execution context, grabbing the ref to the workflow object we're executing
                 var activity = new activityContext(data, this);
 
+                console.log('received task: ', activity.context.activityType.name);
+
                 //** run the activity via its parent workflow
                 activity.workflow.runActivity(activity.context.activityType.name, activity)
                     .then(done.bind(this, true))
@@ -433,13 +461,13 @@ var poll = {
                     this.emit('activity:'+ (!!success?'success':'fail'), activity);
                 }
 
-                //** if we do nothing, it will time out and run the task again after it times out...
+                //** if we do nothing, it will time out and run the task again...
             }
 
             setTimeout(this.poll.activity.bind(this, opts), 0);
         }
 
-        this.emit('polling', opts);
+        this.emit('poll:worker', opts);
         this.svc.pollForActivityTask(opts).done(handleTask.bind(this));
         return this;
     }
