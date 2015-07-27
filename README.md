@@ -42,7 +42,7 @@ Workflo also provides a base implementation for your _Workers_ and _Deciders_ wh
 ###Enough words, show me code
 
 Below is an example workflow that handles an order for a website; it defines the _Workflow's_ minimal [configuration](http://docs.aws.amazon.com/amazonswf/latest/apireference/API_RegisterWorkflowType.html), the _Tasks_ (in order) with their minimal [configuration](http://docs.aws.amazon.com/amazonswf/latest/apireference/API_RegisterActivityType.html), and the handlers for each _Task_.
-```
+```javascript
 Workflo.define('handle-website-order', {
 
     //** defines the workflows meta-data that will be registered with the SWF API
