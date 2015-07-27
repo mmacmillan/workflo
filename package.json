@@ -1,7 +1,7 @@
 {
   "name": "workflo",
   "description": "a schema-based framework, based on the AWS SWF SDK, for easily defining, registering, and executing your workflows",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "homepage": "https://github.com/mmacmillan/workflo",
   "author": {
     "name": "Mike MacMillan",
